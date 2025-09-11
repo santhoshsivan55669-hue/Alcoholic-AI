@@ -3,13 +3,17 @@ import re
 import time
 import statistics
 import ollama
-from scraper import scrape_livcheers_via_typing  # new scraper
+from scraper import scrape_livcheers_via_typing  # scraper with search typing
 
-# Simple in-memory TTL cache (replace with Redis in prod)
+# ----------------------
+# In-memory cache
+# ----------------------
 _CACHE = {}
 CACHE_TTL_SECS = 60 * 10  # 10 minutes
 
+# ----------------------
 # Location + State aliases → city slug
+# ----------------------
 LOCATION_ALIASES = {
     "blr": "bangalore",
     "bengaluru": "bangalore",
@@ -39,6 +43,9 @@ REAL_TIME_KEYWORDS = [
     "now", "update", "cost", "how much", "howmuch"
 ]
 
+# ----------------------
+# Helpers
+# ----------------------
 def _now_ts():
     return int(time.time())
 
@@ -60,9 +67,6 @@ def is_real_time_query(prompt: str) -> bool:
     return any(k in low for k in REAL_TIME_KEYWORDS)
 
 def extract_brand_location(prompt: str):
-    """
-    Extract brand and location from query.
-    """
     loc_match = re.search(
         r"\bin\s+([a-zA-Z\s]+?)(?:\?|$|\b(today|now|current|price|prices|latest|how much|cost)\b)",
         prompt,
@@ -87,7 +91,7 @@ def extract_brand_location(prompt: str):
     else:
         location = loc_clean if loc_clean else ""
 
-    return brand or "alcohol", location or "delhi"  # default city = delhi
+    return brand or "alcohol", location or "delhi"
 
 def _parse_numeric_price(p_str):
     if not p_str:
@@ -123,6 +127,9 @@ def _aggregate_prices(price_list):
         "max": max(cleaned),
     }
 
+# ----------------------
+# Mistral integration
+# ----------------------
 def query_mistral(prompt):
     try:
         response = ollama.chat(
@@ -131,10 +138,16 @@ def query_mistral(prompt):
                 {
                     "role": "system",
                     "content": (
-                        "You are an assistant specialized in alcoholic drinks. "
-                        "Answer only alcohol-related queries in short, complete sentences. "
-                        "If the query is unrelated to alcohol, reply: "
-                        "'Sorry, I can only answer questions related to alcoholic drinks.'"
+                        "You are an assistant specialized in alcoholic drinks.\n"
+                        "Rules:\n"
+                        "- Only return keywords related to alcoholic drinks when possible.\n"
+                        "- Don't use the word apologize.\n"
+                        "- Don't over explain.\n"
+                        "- Always ignore non-alcohol meanings (e.g., 'Corona' → 'Corona Beer').\n"
+                        "- If user asks about unrelated topics (e.g. COVID, politics, sports), "
+                        "return alcohol-related connections (e.g. 'COVID liquor sales', 'alcohol policy politics').\n"
+                        "- When asked for prices or availability, give clear, user-friendly answers.\n"
+                        "- If real-time scraping fails, fall back on your knowledge and include the current year."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -144,19 +157,22 @@ def query_mistral(prompt):
     except Exception:
         return None
 
+# ----------------------
+# Main handler
+# ----------------------
 def handle_query(prompt, limit=6, debug=False):
-    # Non-real-time → Mistral only
+    # Non-real-time → use Mistral only
     if not is_real_time_query(prompt):
         ans = query_mistral(prompt)
-        return ans or "Sorry, I can only answer questions related to alcoholic drinks."
+        return ans or "I can only answer alcohol-related queries."
 
-    # Extract
+    # Extract brand + location
     brand_raw, location = extract_brand_location(prompt)
     brand = brand_raw.strip()
     if debug:
         print(f"DEBUG: Extracted brand='{brand}', location='{location}'")
 
-    # Cache
+    # Cache check
     cache_key = f"scrape::{brand.lower()}::{location.lower()}"
     scraped = _cache_get(cache_key)
     if not scraped:
@@ -168,12 +184,12 @@ def handle_query(prompt, limit=6, debug=False):
             scraped = []
         _cache_set(cache_key, scraped)
 
-    # Filter
+    # Filter results
     qterm = brand.lower().strip()
     relevant = [item for item in scraped if qterm in (item.get("name") or "").lower()]
     used = relevant if relevant else scraped
 
-    # Parse
+    # Parse prices
     numeric_prices, examples = [], []
     for it in used:
         price_str = it.get("price") or ""
@@ -185,7 +201,7 @@ def handle_query(prompt, limit=6, debug=False):
     agg = _aggregate_prices(numeric_prices)
     year = datetime.datetime.now().year
 
-    # Case 1: We got numeric prices
+    # Case 1: Valid numeric data
     if agg:
         avg_price = _format_inr(agg["median"])
         mn_fmt = _format_inr(agg["min"])
@@ -200,20 +216,19 @@ def handle_query(prompt, limit=6, debug=False):
             + (f"Some examples: {examples_text}." if examples_text else "")
         )
 
-    # Case 2: No usable data → fall back to Mistral
-    if not used:
-        mistral_ans = query_mistral(prompt)
-        return f"As of {year}, {mistral_ans}" if mistral_ans else f"As of {year}, no data could be found."
+    # Case 2: Nothing usable → fallback to Mistral
+    mistral_ans = query_mistral(prompt)
+    return f"As of {year}, {mistral_ans}" if mistral_ans else f"As of {year}, no data could be found."
 
-    # Case 3: Listings exist but prices not numeric
-    example_text = ", ".join([f"{e['name']} {e['price']}" for e in examples[:4]])
-    return (
-        f"As of {year}, I found these listings for {brand or 'the requested item'}"
-        + (f" in {location.title()}" if location else "")
-        + f": {example_text}. Exact prices could not be parsed."
-    )
-
+# ----------------------
+# Interactive CLI
+# ----------------------
 if __name__ == "__main__":
-    print(handle_query("Give me Kingfisher prices in Tamilnadu today", limit=6, debug=True))
-    print(handle_query("What is the price of Old Monk in Goa?", limit=6, debug=True))
-    print(handle_query("Suggest cocktails with vodka"))
+    print("🥂 Welcome to Alcoholic-AI (powered by Mistral + Livcheers)\n")
+    while True:
+        user_query = input("🍺 Enter your alcohol query (or type 'exit' to quit): ").strip()
+        if user_query.lower() in ["exit", "quit", "q"]:
+            print("👋 Goodbye! Cheers!")
+            break
+        answer = handle_query(user_query, limit=6, debug=False)
+        print("\n💡 " + answer + "\n")
